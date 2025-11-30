@@ -16,142 +16,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from functions import my_peaks, normal_binify, to_coords
+from scipy.interpolate import make_interp_spline
 
 sns.set(context="notebook", style="whitegrid")
 
 # %%
 channel_data = pd.read_pickle("channel_data.pickle")
-
-# %%
-channel_data = pd.DataFrame(
-    {
-        "values": channels,
-        "median": [np.median(values[values > 0]) for values in channels],
-        "count": [len(values[values > 0]) for values in channels],
-    }
-)
-ax = channel_data.plot.scatter(x="median", y="count")
-ax.figure.tight_layout()
-# ax.figure.savefig('scatter-unfiltered.png')
-
-# %%
-median_sort = channel_data["median"].sort_values().index
-count_sort = channel_data["count"].sort_values().index
-fig, axes = plt.subplots(nrows=6, ncols=3)
-fig.set_size_inches(3 * 6, 6 * 6)
-rng = np.random.default_rng()
-for col, (group, name) in enumerate(
-    [
-        (median_sort[[0, 1, 2, -3, -2, -1]], "Extreme counts"),
-        (count_sort[[0, 1, 2, -3, -2, -1]], "Extreme median"),
-        (rng.choice(channel_data.index, 6, replace=False), "Random"),
-    ]
-):
-    for row, idx in enumerate(group):
-        hist, bins = normal_binify(channel_data.loc[idx]["values"], bins_to_median=1000)
-        axes[row, col].step(bins, hist, where="mid")
-        """
-        params, _ = my_peaks(hist, bins, n=15)
-        for [center, height, std, base_offset, base_slope] in params:
-            axes[row, col].scatter(center, height + base_offset, color='red')
-        axes[row, col].set_yscale('log')
-        if row == 0:
-            axes[row, col].set_title(name)
-        if col == 0:
-            axes[row, col].set_ylabel(['Lowest', '2nd lowest', '3rd lowest', '3rd highest', '2nd highest', 'Highest'][row])
-        """
-plt.tight_layout()
-# fig.savefig('filtered.png')
-
-# %%
-channel_data = channel_data.query("(count > 50000) & (median > 4000)")
-ax = channel_data.plot.scatter(x="median", y="count")
-ax.figure.tight_layout()
-# ax.figure.savefig('scatter-filtered.png')
-
-# %%
-chan1_top5 = pd.read_pickle("chan1_top5.pickle")
-find_matches_of = to_coords(chan1_top5)
-
-# %%
-from scipy.interpolate import make_interp_spline
-values1 = channel_data.loc[1, 'values']
-hist1, bins1 = np.histogram(values1)
-
-def difference(stuff):
-    histr, _ = stuff
-    min_len = min(len(histr), len(hist1))
-    return ((hist1[:min_len] - histr[:min_len]) ** 2).sum()
-
-
-hist1, bins1 = normal_binify(channel_data.loc[1, "values"])
-
-channel_data["distance"] = [
-    (
-        (
-            find_matches_of
-            - to_coords(row["params"].iloc[row["matches"]].values)
-            * row[["energy_correct", "height_correct"]].values
-        )
-        ** 2
-    ).sum()
-    for _, row in channel_data.iterrows()
-]
-
-channel_data["error"] = [
-    difference(row['adjusted_hist'])
-    for _, row in channel_data.iterrows()
-]
-
-# %%
-channel_data[channel_data.index != 1].plot.scatter(x="distance", y="error", marker=".")
-old_channel_data = channel_data
-#channel_data = channel_data.query("(error < 30000) & (distance < .5)")
-
-# %%
-fig, axes = plt.subplots(nrows=3, ncols=2)
-for aidx, ax in enumerate(axes.flatten()):
-    a = 0
-
-    def adjust(y):
-        if aidx == 0:
-            return y * np.exp(a)
-        else:
-            return y + a
-
-    if aidx == 0:
-        ax.set_yscale("log")
-    for channel, stepcolor in zip(
-        channel_data.index, sns.color_palette("viridis", n_colors=len(channel_data))
-    ):
-        bx = channel_data.loc[channel, "energy_correct"]
-        by = channel_data.loc[channel, "height_correct"]
-        hist, bins = normal_binify(channel_data.loc[channel, "values"], adjust=bx)
-        ax.step(bins, adjust(hist * by), color=stepcolor, alpha=0.75, where="mid")
-        params = channel_data.loc[channel, "params"]
-        # ax.scatter(params['center'] * b, adjust(params.eval('height + offset')), color='red', marker='.')
-        # matched = params.iloc[channel_data.loc[channel, 'matches']]
-        # ax.scatter(matched['center'] * b, adjust(matched.eval('height + offset')), color='black', marker='.')
-        if aidx > 0:
-            # ax.scatter(matched['center'].iloc[aidx-1] * b, adjust(matched.eval('height + offset')).iloc[aidx-1], color='black')
-            # distances = ((find_matches_of[aidx-1] - to_coords(params.values) * [bx, by]) ** 2).sum(axis=1)
-            # print(distances)
-            # closest = params.iloc[np.argmin(distances)]
-            closest = params.iloc[channel_data.loc[channel, "matches"][aidx - 1]]
-            ax.scatter(
-                closest["center"] * bx,
-                adjust((closest["height"] + closest["offset"]) * by),
-                color="black",
-            )
-        # ax.scatter(params['center'] * b, adjust(params.eval('height + offset')), color='black', marker='.')
-        a -= 0.5
-
-for peak, ax in zip(chan1_top5, axes.flatten()[1:]):
-    ax.set_xlim(peak[0] - 0.0875, peak[0] + 0.0875)
-    ax.scatter(peak[0], peak[1] + peak[3], color="red")
-
-fig.set_size_inches(2 * 5, 3 * 8)
-plt.tight_layout()
+master_peaks = pd.read_pickle("chan1_top5.pickle")
+find_matches_of = to_coords(master_peaks)
 
 # %% [markdown]
 # ### Traditional Analysis
@@ -303,13 +175,13 @@ plt.tight_layout()
 # %%
 values = channels[1]
 hist, bins = normal_binify(values, bins_to_median=3000)
-chan1_top5, windows = my_peaks(hist, bins, n=5)
+master_peaks, windows = my_peaks(hist, bins, n=5)
 fig, axes = plt.subplots(nrows=3, ncols=2)
 axes = axes.flatten()
 axes[0].step(bins, hist, where="mid")
 axes[0].set_yscale("log")
 for i, ([center, height, std, base_offset, base_slope], (left, right)) in enumerate(
-    zip(chan1_top5, windows)
+    zip(master_peaks, windows)
 ):
     axes[0].scatter(center, height + base_offset, color="red")
     axes[i + 1].step(bins, hist, where="mid")

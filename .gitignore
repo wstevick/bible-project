@@ -210,3 +210,6 @@ __marimo__/
 # Pickles
 *.pickle
 pickles/
+
+# output images
+*.png

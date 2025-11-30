@@ -1,22 +1,32 @@
+import operator
 import pickle
 from itertools import combinations
-from multiprocessing import Lock, Pool
-from operator import mul
+from multiprocessing import Pool
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 from numba import jit
 from scipy.interpolate import make_interp_spline
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks, savgol_filter
 
+# global variables used by multiple functions
+channel_data = None
+master_peaks = None
+find_matches_of = None
+match_shape = None
+match_allbins = None
 
+
+# general utilify functions
 def to_coords(params):
     """
+    Convert a peak to an xy Cartesian point
     X position is peak energy
-    Y position is log of peak height
+    Y position is peak height
     """
     coords = np.array(
         [[center, height] for [center, height, std, offset, slope] in params]
@@ -26,16 +36,23 @@ def to_coords(params):
     return coords
 
 
+def normal_binify(data, bins_to_median=2500):
+    """
+    Histogram a dataset such that each bin is 1/`bins_to_median`th the median.
+    """
+    hist, bins = np.histogram(data, int(bins_to_median * data.max() / np.median(data)))
+    return hist, (bins[:-1] + bins[1:]) / 2
+
+
+# peak finding
 @jit(nopython=True)
 def linear_guass(x, center, height, std, base_offset, base_slope):
+    """
+    Gaussian + linear function
+    """
     gaussian = np.e ** -((x - center) ** 2 / (2 * std**2)) * height
     linear_base = (x - center) * base_slope + base_offset
     return gaussian + linear_base
-
-
-def normal_binify(data, bins_to_median=2500):
-    hist, bins = np.histogram(data, int(bins_to_median * data.max() / np.median(data)))
-    return hist, (bins[:-1] + bins[1:]) / 2
 
 
 def my_peaks(hist, bins, n=10):
@@ -103,97 +120,124 @@ def my_peaks(hist, bins, n=10):
     return fit_params[select], np.array(windows)[select]
 
 
-def find_peaks_worker(wid, q, params_lock, print_lock):
-    with print_lock:
-        print(f"Worker #{wid} starting")
-
-    while True:
-        job = q.get()
-        if job == "finish":
-            with print_lock:
-                print(f"Worker #{wid} done")
-            q.task_done()
-            return
-        else:
-            with print_lock:
-                print(f"Processing channel {job}")
-
-        values = channel_data.loc[job, "values"]
+def find_peaks_worker(chan):
+    """
+    Runs in parallel on all cores
+    """
+    print("Finding peaks for", chan)
+    values = channel_data.loc[chan, "values"]
+    try:
         hist, bins = normal_binify(values)
-        params, _ = my_peaks(hist, bins, n=10)
-
-        with params_lock:
-            write_row("params.csv", "a", [job, *np.array(params).flatten()])
-        with print_lock:
-            print(f"Found params for channel {job}")
-
-        q.task_done()
+    except ValueError:
+        return None
+    params, _ = my_peaks(hist, bins, n=10)
+    return params
 
 
-def find_matches_worker(find_matches_of, wid, q, match_lock, print_lock):
-    with print_lock:
-        print(f"Worker #{wid} starting")
+def find_matches(chan, difference_method):
+    peaks = channel_data.loc[chan, "peaks"]
 
-    while True:
-        job = q.get()
-        if job == "finish":
-            with print_lock:
-                print(f"Worker #{wid} done")
-            q.task_done()
-            return
-        else:
-            with print_lock:
-                print(f"Processing channel {job}")
+    possible_choices = []
+    differences = []
+    bs = []
+    for choice in combinations(range(len(peaks)), r=find_matches_of.shape[0]):
+        coords = to_coords(peaks[choice, :])
+        [energy_correct], _ = curve_fit(
+            operator.mul, coords[:, 0], find_matches_of[:, 0], p0=[1]
+        )
+        [height_correct], _ = curve_fit(
+            operator.mul, coords[:, 1], find_matches_of[:, 1], p0=[1]
+        )
+        b = [energy_correct, height_correct]
+        differences.append(difference_method(chan, coords, b))
+        possible_choices.append(choice)
+        bs.append(b)
 
-        params = all_params.loc[job]
-
-        possible_choices = []
-        differences = []
-        bs = []
-        for choice in combinations(range(len(params)), r=find_matches_of.shape[0]):
-            coords = to_coords(params[i] for i in choice)
-            [energy_correct], _ = curve_fit(
-                mul, coords[:, 0], find_matches_of[:, 0], p0=[1]
-            )
-            [height_correct], _ = curve_fit(
-                mul, coords[:, 1], find_matches_of[:, 1], p0=[1]
-            )
-            b = [energy_correct, height_correct]
-            differences.append(((find_matches_of - coords * b) ** 2).sum(axis=1).sum())
-            possible_choices.append(choice)
-            bs.append(b)
-
-        best = np.argmin(differences)
-        with match_lock:
-            write_row(
-                "matches.csv",
-                "a",
-                [job, *bs[best], *possible_choices[best]],
-            )
-        with print_lock:
-            print(f"Found matches for channel {job}")
-
-        q.task_done()
+    best = np.argmin(differences)
+    return bs[best], peaks[possible_choices[best], :], differences[best]
 
 
-def calculate_master_coords(channel_data, channel):
+def coords_difference(chan, coords, b):
+    return ((find_matches_of - coords * b) ** 2).sum(axis=1).sum()
+
+
+def find_coords_matches_worker(chan):
+    """
+    Runs in parallel on call cores
+    """
+    difference_method = coords_difference
+    name = "coords"
+
+    print(f"Finding {name} matches for", chan)
+    best, peaks, difference = find_matches(chan, difference_method)
+    return {
+        f"{name}_ec": best[0],
+        f"{name}_hc": best[1],
+        f"{name}_diff": difference,
+        f"matches_{name}": peaks,
+    }
+
+
+def shape_difference(chan, coords, b):
+    spl = make_interp_spline([0, *coords[:, 0]], [0, *find_matches_of[:, 0]])
+    values = channel_data.loc[chan, "values"]
+    new_values = spl(values)
+    hist, _ = np.histogram(new_values, match_allbins)
+    return np.sum((hist * b[1] - match_shape) ** 2)
+
+
+def find_shape_matches_worker(chan):
+    """
+    Runs in parallel on call cores
+    """
+    difference_method = shape_difference
+    name = "shape"
+
+    print(f"Finding {name} matches for", chan)
+    best, peaks, difference = find_matches(chan, difference_method)
+    return {
+        f"{name}_ec": best[0],
+        f"{name}_hc": best[1],
+        f"{name}_diff": difference,
+        f"matches_{name}": peaks,
+    }
+
+
+def align_spectra(master_centers):
+    all_values = []
+    for matched, values in zip(master_centers, channel_data["values"]):
+        spl = make_interp_spline([0, *matched], [0, *find_matches_of[:, 0]])
+        new_values = spl(values)
+        all_values.append(new_values)
+    return all_values
+
+
+# data retrieval functions
+def calculate_master_peaks(channel):
     try:
         with open(f"chan{channel}_top5.pickle", "rb") as f:
-            return to_coords(pickle.load(f))
+            return pickle.load(f)
     except FileNotFoundError:
         print(f"Looking for five peaks in channel {channel}")
         values = channel_data.loc[channel, "values"]
         hist, bins = normal_binify(values)
-        top, _ = my_peaks(hist, bins, n=5)
+        top, windows = my_peaks(hist, bins, n=5)
+        with open(f"chan{channel}_top5_windows.pickle", "wb") as f:
+            pickle.dump(bins[windows], f)
 
         with open(f"chan{channel}_top5.pickle", "wb") as f:
             pickle.dump(top, f)
 
         print(f"Done finding peaks in {channel}")
-        return to_coords(top)
+        return top
 
 
 def load_channel_data():
+    try:
+        return pd.read_pickle("channel_data.pickle")
+    except FileNotFoundError:
+        pass
+
     channel_data = pd.DataFrame(columns=["values"])
 
     with h5py.File("Gamma/210601_NBS295-106/20210601_152616_mass-001.hdf5") as f:
@@ -211,7 +255,6 @@ def load_channel_data():
     channel_data["median"] = channel_data["values"].apply(np.median)
     channel_data["count"] = channel_data["values"].apply(len)
 
-    """
     fig, axes = plt.subplots(nrows=2)
     for ax, title in zip(axes, ["Unfiltered", "Filtered"]):
         channel_data.plot.scatter(x="median", y="count", ax=ax)
@@ -220,32 +263,136 @@ def load_channel_data():
     fig.set_size_inches(4, 6)
     fig.tight_layout()
     fig.savefig("filter-show.png")
-    """
 
     return channel_data
 
 
-def big_math(channel_data, find_matches_of):
-    print_lock = Lock()
+# plotting functions
+def make_master_peaks_plot(hist, bins, savename):
+    fig, axes = plt.subplots(nrows=3, ncols=2)
+
+    with open("chan1_top5_windows.pickle", "rb") as f:
+        windows = pickle.load(f)
+
+    peak_centers = master_peaks[:, 0]
+    peak_heights = [hist[np.abs(bins - center).argmin()] for center in peak_centers]
+
+    for aidx, ax in enumerate(axes.flatten(), start=-1):
+        ax.step(bins, hist, where="mid")
+        ax.scatter(peak_centers, peak_heights, color="red")
+        if aidx > -1:
+            [center, height, std, offset, slope] = master_peaks[aidx]
+            window = windows[aidx]
+            xs = np.linspace(*window)
+            baseline = (xs - center) * slope + offset
+            gaussian = np.e ** -((xs - center) ** 2 / (2 * std**2)) * height
+            ax.plot(xs, baseline)
+            ax.plot(xs, gaussian + baseline)
+            ax.axvline(center, color="black", alpha=0.5)
+            ax.set_xlim(center - 1000, center + 1000)
+
+    fig.set_size_inches(9, 9)
+    fig.tight_layout()
+    fig.savefig(savename)
+    print(f'"{savename}" generated')
+
+
+def make_waterfall_plot(name, savename):
+    print("Generating waterfall plot for", name)
+    fig, axes = plt.subplots(nrows=3, ncols=2)
+    fig.suptitle(f"Waterfall plot for {name}")
+
+    def adjust(y):
+        return y + a
+
+    bins = None
+    for aidx, ax in enumerate(axes.flatten()):
+        a = 0
+
+        if aidx == 0:
+            ax.set_xlim(0, 13000)
+        for channel, stepcolor in zip(
+            channel_data.index,
+            sns.color_palette("colorblind", n_colors=len(channel_data)),
+        ):
+            hc = channel_data.loc[channel, f"{name}_hc"]
+            coords = to_coords(channel_data.loc[channel, f"matches_{name}"])
+            spl = make_interp_spline([0, *coords[:, 0]], [0, *find_matches_of[:, 0]])
+            values = channel_data.loc[channel, "values"]
+            new_values = spl(values)
+            if bins is None:
+                hist, bins = np.histogram(new_values, 40000)
+            else:
+                hist, _ = np.histogram(new_values, bins)
+            ax.step(
+                bins[:-1],
+                adjust(hist * hc),
+                color=stepcolor,
+                alpha=0.75,
+                where="pre",
+            )
+            a -= 100
+
+    for peak, ax in zip(master_peaks, axes.flatten()[1:]):
+        ax.set_xlim(peak[0] - 100, peak[0] + 100)
+
+    fig.set_size_inches(2 * 8, 3 * 12)
+    fig.tight_layout()
+    fig.savefig(savename)
+    print(f'"{savename}" generated')
+
+
+def main():
+    global channel_data  # noqa: PLW0603
+    global master_peaks  # noqa: PLW0603
+    global find_matches_of  # noqa: PLW0603
+    global match_shape
+    global match_allbins
+
+    sns.set_theme(style="whitegrid", context="paper")
+
+    channel_data = load_channel_data()
+
+    master_peaks = calculate_master_peaks(1)
+    make_master_peaks_plot(*normal_binify(channel_data.loc[1, "values"]), "master_peaks.png")
+    find_matches_of = to_coords(master_peaks)
+    values1 = channel_data.loc[1, "values"]
+    match_shape, match_allbins = np.histogram(
+        values1, bins=int(2500 * values1.max() / np.median(values1))
+    )
+
     with Pool() as p:
-        p.map(lambda values: my_peaks(*normal_binify(values)), channel_data["values"])
+        if "peaks" not in channel_data.columns:
+            channel_data["peaks"] = p.map(find_peaks_worker, channel_data.index)
+            channel_data = channel_data[~pd.isna(channel_data["peaks"])]
+            channel_data.to_pickle("channel_data.pickle")
+        for worker, name in [
+            (find_coords_matches_worker, "matches_coords"),
+            (find_shape_matches_worker, "matches_shape"),
+        ]:
+            if name not in channel_data.columns:
+                match_data = pd.DataFrame(
+                    p.map(worker, channel_data.index), index=channel_data.index
+                )
+                channel_data = pd.concat([channel_data, match_data], axis=1)
+                channel_data.to_pickle("channel_data.pickle")
 
-    with print_lock:
-        print(f"{nworkers} workers started")
+    make_waterfall_plot("coords", "all-spectra-coords-aligned.png")
+    make_waterfall_plot("shape", "all-spectra-shape-aligned.png")
+    channel_data = channel_data.drop([23, 27]) # didn't coords align
+    make_waterfall_plot("coords", "all-spectra-coords-aligned-outliers.png")
 
-    for job in channel_data.index:
-        q.put(job)
-
-    q.join()
-
-    for _ in range(nworkers):
-        q.put("finish")
-
-    q.join()
-
-    print("All done")
+    aligned_values = align_spectra(
+        channel_data["matches_coords"].apply(lambda a: to_coords(a)[:, 0])
+    )
+    nbins = 40000
+    bins = np.arange(nbins + 1) / nbins * 15000
+    added_hist = np.zeros(nbins)
+    for values in aligned_values:
+        hist, _ = np.histogram(values, bins)
+        added_hist += hist
+    make_master_peaks_plot(added_hist, (bins[:-1] + bins[1:]) / 2, "coadded.png")
 
 
 if __name__ == "__main__":
-    channel_data = load_channel_data()
-    # big_math(channel_data, calculate_coords(channel_data, 1))
+    main()

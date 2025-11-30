@@ -14,11 +14,11 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks, savgol_filter
 
 # global variables used by multiple functions
-channel_data = None
-master_peaks = None
-find_matches_of = None
-match_shape = None
-match_allbins = None
+channel_data = None  # pandas DataFrame - one row per channel
+master_peaks = None  # (number of master peaks)x(number of parametrs) array
+find_matches_of = None  # (number of master peaks)x2 array - sorted by energy
+match_shape = None  # histogram values of the silhouette of the master channel
+match_allbins = None  # bins of `match_shape`
 
 
 # general utilify functions
@@ -365,9 +365,8 @@ def snr_plot(
     [height, std, offset, slope] = fit_peak(added_hist)
 
     fig, axes = plt.subplots(nrows=2, ncols=1)
-    axes[0].axvline(peak_center / std, color="black")
+    # axes[0].axvline(peak_center / std, color="black")
     axes[0].hist(snrs, bins=nbins)
-    axes[0].set_xlim(min(snrs) - 0.0002, max(snrs) + 0.0002)
     axes[0].set_title(f"SNR histogram (global SNR at {peak_center / std:.2f})")
 
     axes[1].step(bins, added_hist, where="mid")
@@ -376,7 +375,7 @@ def snr_plot(
     axes[1].plot(xdata, baseline)
     axes[1].plot(xdata, gaussian + baseline)
     axes[1].set_xlim(peak_center - 100, peak_center + 100)
-    axes[1].set_title("Fit peak of coadded data")
+    axes[1].set_title("Fit peak of co-added data")
 
     fig.suptitle(f"SNR for {title}")
     save_figure(fig, savename)
@@ -464,7 +463,9 @@ def main():
 
     bin_centers = (bins[:-1] + bins[1:]) / 2
 
-    make_master_peaks_plot(added_hist, bin_centers, "coadded.png", show_fit=False)
+    make_master_peaks_plot(
+        added_hist, bin_centers, "coadded.png", "Co-added peaks", show_fit=False
+    )
 
     most_prominent = master_peaks[master_peaks[:, 1].argmax()]
     snr_plot(
@@ -474,12 +475,13 @@ def main():
         most_prominent[0],
         20,
         "biggest_peak_snr.png",
-        100,
-        "Biggest Peak",
+        50,
+        f"Biggest Peak ({int(most_prominent[0])}arb)",
     )
 
     allpeaks, _ = my_peaks(added_hist, bin_centers, n=0)
-    ideal_size = most_prominent[1] / 10
+    most_prominent_on_allpeaks = allpeaks[np.argmax(allpeaks[:, 1])]
+    ideal_size = most_prominent_on_allpeaks[1] / 10
     little_peak = allpeaks[np.argmin(np.abs(allpeaks[:, 1] - ideal_size))]
 
     snr_plot(
@@ -490,7 +492,7 @@ def main():
         20,
         "little_peak_snr.png",
         10,
-        "Little Peak",
+        f"Little Peak ({int(little_peak[0])}arb)",
     )
 
 

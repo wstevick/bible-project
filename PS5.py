@@ -234,7 +234,7 @@ def calculate_master_peaks(channel):
         return top
 
 
-def load_channel_data():
+def load_channel_data(make_plot=False):
     try:
         return pd.read_pickle("channel_data.pickle")
     except FileNotFoundError:
@@ -257,14 +257,15 @@ def load_channel_data():
     channel_data["median"] = channel_data["values"].apply(np.median)
     channel_data["count"] = channel_data["values"].apply(len)
 
-    fig, axes = plt.subplots(nrows=2)
-    for ax, title in zip(axes, ["Unfiltered", "Filtered"]):
-        channel_data.plot.scatter(x="median", y="count", ax=ax)
-        ax.set_title(title)
-        channel_data = channel_data.query("(count > 50000) & (median > 4000)")
-    fig.set_size_inches(4, 6)
-    fig.suptitle("Showing which channels are trimmed before analysis")
-    save_figure(fig, "filter-show.png")
+    if make_plot:
+        fig, axes = plt.subplots(nrows=2)
+        for ax, title in zip(axes, ["Unfiltered", "Filtered"]):
+            channel_data.plot.scatter(x="median", y="count", ax=ax)
+            ax.set_title(title)
+            channel_data = channel_data.query("(count > 50000) & (median > 4000)")
+        fig.set_size_inches(4, 6)
+        fig.suptitle("Showing which channels are trimmed before analysis")
+        save_figure(fig, "filter-show.png")
 
     return channel_data
 
@@ -390,7 +391,7 @@ def main():
 
     sns.set_theme(style="whitegrid", context="paper")
 
-    channel_data = load_channel_data()
+    channel_data = load_channel_data(make_plot=True)
 
     master_peaks = calculate_master_peaks(1)
     make_master_peaks_plot(
